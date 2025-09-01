@@ -1,0 +1,1 @@
+huggingface-cli download --repo-type dataset --resume-download kjj0/fineweb10B-gpt2 --local-dir  data/
