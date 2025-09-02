@@ -34,12 +34,18 @@ class SpectralAnalyzerWithMSign:
         
         for _ in range(steps):
             # Newton-Schulz迭代: X_{k+1} = X_k * (a0*I + a1*X_k^2 + a2*X_k^4)
-            X2 = X @ X.mT  # X^2（对于非方阵使用X @ X^T）
-            X4 = X2 @ X2   # X^4
-            
-            # 多项式组合
-            poly = a0 * torch.eye(X2.size(-1), device=X.device) + a1 * X2 + a2 * X4
-            X = X @ poly
+            if X.size(-2) >= X.size(-1):
+                # 对于 m >= n 的情况，使用 X @ X.T
+                X2 = X @ X.mT  # X @ X^T
+                X4 = X2 @ X2   # (X @ X^T)^2
+                poly = a0 * torch.eye(X.size(-2), device=X.device) + a1 * X2 + a2 * X4
+                X = poly @ X  # 左乘多项式
+            else:
+                # 对于 m < n 的情况，使用 X^T @ X
+                X2 = X.mT @ X  # X^T @ X
+                X4 = X2 @ X2   # (X^T @ X)^2
+                poly = a0 * torch.eye(X.size(-1), device=X.device) + a1 * X2 + a2 * X4
+                X = X @ poly  # 右乘多项式
         
         return X
     
@@ -241,8 +247,19 @@ class EnhancedMuonMonitor:
         msign_version = self.analyzer.msign_newton_schulz(matrix.clone())
         
         # 3. 比较正交性
-        original_error = torch.norm(original @ original.T - torch.eye(original.size(0), device=matrix.device))
-        msign_error = torch.norm(msign_version @ msign_version.T - torch.eye(msign_version.size(0), device=matrix.device))
+        # 对于非方阵，检查 U @ U^T = I（左正交性）或 U^T @ U = I（右正交性）
+        if original.size(0) >= original.size(1):
+            # 检查左正交性: U @ U^T = I
+            I_orig = torch.eye(original.size(0), device=matrix.device)
+            I_msign = torch.eye(msign_version.size(0), device=matrix.device)
+            original_error = torch.norm(original @ original.T - I_orig)
+            msign_error = torch.norm(msign_version @ msign_version.T - I_msign)
+        else:
+            # 检查右正交性: U^T @ U = I
+            I_orig = torch.eye(original.size(1), device=matrix.device)
+            I_msign = torch.eye(msign_version.size(1), device=matrix.device)
+            original_error = torch.norm(original.T @ original - I_orig)
+            msign_error = torch.norm(msign_version.T @ msign_version - I_msign)
         
         results['original_orthogonality_error'] = original_error.item()
         results['msign_orthogonality_error'] = msign_error.item()
@@ -253,9 +270,11 @@ class EnhancedMuonMonitor:
     def _original_newton_schulz(self, G: torch.Tensor, steps: int = 5) -> torch.Tensor:
         """原始的Newton-Schulz实现（作为对比）"""
         a, b, c = (3.4445, -4.7750, 2.0315)
-        X = G
+        X = G.clone()
+        transposed = False
         if G.size(0) > G.size(1):
             X = X.T
+            transposed = True
         X = X / (X.norm() + 1e-7)
         
         for _ in range(steps):
@@ -263,7 +282,7 @@ class EnhancedMuonMonitor:
             B = b * A + c * A @ A
             X = a * X + B @ X
             
-        if G.size(0) > G.size(1):
+        if transposed:
             X = X.T
         return X
     
@@ -349,7 +368,7 @@ class EnhancedMuonMonitor:
         all_orthogonal_alignments = []
         all_effective_lr_scales = []
         
-        for layer_name, analysis in layer_analysis.items():
+        for _, analysis in layer_analysis.items():
             if 'grad_spectral_norm' in analysis:
                 all_spectral_norms.append(analysis['grad_spectral_norm'])
             if 'grad_condition_number' in analysis:
