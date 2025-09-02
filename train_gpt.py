@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
 
+# Import spectral monitoring system
+from Spectral_monitor import EnhancedMuonMonitor
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
@@ -566,6 +569,9 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    # spectral monitoring
+    enable_spectral_monitoring = True # enable spectral monitoring with wandb
+    spectral_monitor_freq = 25 # frequency for spectral monitoring
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -652,6 +658,16 @@ def get_window_size_blocks(step: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
+# Initialize spectral monitor
+spectral_monitor = None
+if args.enable_spectral_monitoring:
+    spectral_monitor = EnhancedMuonMonitor(
+        model=model, 
+        monitor_freq=args.spectral_monitor_freq,
+        use_wandb=True,
+        project_name="speedrun-spectral-monitoring"
+    )
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -720,14 +736,33 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    loss = model(inputs, targets, get_window_size_blocks(step))
+    loss.backward()
+    
     # set optimization hyperparameters
+    current_lr = None
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+            current_lr = group["initial_lr"] * get_lr(step)
+            group["lr"] = current_lr
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    
+    # Collect optimizer state for spectral monitoring
+    if spectral_monitor is not None:
+        optimizer_state = {}
+        for name, param in model.named_parameters():
+            if param in optimizer2.state:  # Muon optimizer state
+                optimizer_state[name] = optimizer2.state[param]
+        
+        # Monitor training step
+        spectral_monitor.monitor_training_step(
+            loss=loss, 
+            optimizer_state=optimizer_state,
+            learning_rate=current_lr
+        )
+    
     # step the optimizers
     for opt in optimizers:
         opt.step()
@@ -739,4 +774,9 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+# Clean up spectral monitoring
+if spectral_monitor is not None:
+    spectral_monitor.finish_monitoring()
+
 dist.destroy_process_group()
